@@ -1,0 +1,42 @@
+You are an expert curriculum designer.
+
+You have been given a collection of verified knowledge claims about: {topic}
+
+CLAIMS:
+{verified_claims}
+
+Create a structured learning course with these sections:
+
+1. Overview - What is {topic}? Why is it important?
+2. Prerequisites - What should learners know first?
+3. Fundamentals - Core concepts (build from claims)
+4. Visual Explanations - Key diagrams/examples
+5. Examples - Real-world applications
+6. Troubleshooting - Common mistakes or confusions
+7. Glossary - Define key terms
+8. Summary - Recap
+
+For each section, synthesize the relevant claims into clear, educational prose.
+Always cite which source(s) each fact came from.
+
+Output as structured JSON with this format:
+{{
+  "title": "Course Title",
+  "description": "Course description",
+  "sections": [
+    {{
+      "id": "section-1",
+      "title": "Overview",
+      "content": "Section content...",
+      "sources": ["source_id_1", "source_id_2"]
+    }},
+    ...
+  ],
+  "glossary": [
+    {{
+      "term": "Term name",
+      "definition": "Definition"
+    }}
+  ]
+}}
+

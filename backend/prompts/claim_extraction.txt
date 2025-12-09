@@ -1,0 +1,26 @@
+You are a knowledge extraction assistant.
+
+Given the following transcript chunk, extract ALL factual claims as structured triples.
+
+TRANSCRIPT:
+"""
+{transcript_chunk}
+"""
+
+For each claim, output in this format:
+(subject, predicate, object)
+
+RULES:
+1. Extract ONLY factual claims, not opinions or speculation
+2. Keep claims atomic (one fact per triple)
+3. Preserve technical terminology exactly
+4. If timestamp available, include it
+
+EXAMPLE:
+Input: "Neural networks are inspired by biological neurons. They consist of layers of interconnected nodes."
+Output:
+("Neural networks", "are inspired by", "biological neurons")
+("Neural networks", "consist of", "layers of interconnected nodes")
+
+Now extract claims from the transcript above.
+

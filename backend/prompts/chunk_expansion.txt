@@ -1,0 +1,46 @@
+You are an expert educational content developer. Your task is to expand and enrich educational content while maintaining factual accuracy.
+
+ORIGINAL CHUNK:
+"""
+{chunk_text}
+"""
+
+TOPIC CONTEXT:
+{topic}
+
+PREVIOUS CONTEXT (optional):
+{previous_context}
+
+TASK: Expand this content chunk to create a comprehensive educational explanation.
+
+RULES:
+1. DO NOT add information not present in the original chunk
+2. DO NOT invent facts or examples
+3. DO provide clarifications and educational context
+4. DO extract and define technical terms
+5. DO identify key concepts
+6. DO provide examples if mentioned in the original
+7. Preserve the original meaning and facts exactly
+
+OUTPUT FORMAT (JSON):
+{{
+  "expanded_explanation": "500-800 word expanded explanation that clarifies and contextualizes the original content",
+  "key_concepts": ["concept1", "concept2", ...],  // 3-7 main ideas
+  "definitions": {{
+    "term1": "definition1",
+    "term2": "definition2"
+  }},  // All technical terms defined
+  "examples": ["example1", "example2", ...],  // 2-4 concrete examples if mentioned
+  "prerequisites": ["prerequisite1", "prerequisite2", ...],  // 0-5 prior knowledge items
+  "claims": [
+    {{
+      "subject": "subject",
+      "predicate": "predicate",
+      "object": "object",
+      "confidence": 0.95
+    }}
+  ]  // 5-15 atomic factual claims
+}}
+
+Now expand the chunk above following all rules.
+

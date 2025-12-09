@@ -1,0 +1,68 @@
+# ===========================
+# PYTHON / BACKEND
+# ===========================
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.sqlite
+*.db
+*.db-shm
+*.db-wal
+
+# Environment variables
+.env
+backend/.env
+backend/**/*.env
+
+# Local data/cache directories
+backend/data/
+backend/data/cache/
+backend/data/frames/
+
+# Virtual environment
+venv/
+.venv/
+
+
+# ===========================
+# NODE / NEXT.JS FRONTEND
+# ===========================
+node_modules/
+.next/
+dist/
+out/
+
+# Environment variables
+frontend/.env
+frontend/.env.local
+frontend/.env.development
+frontend/.env.production
+frontend/.env.test
+
+
+# ===========================
+# SYSTEM / EDITOR FILES
+# ===========================
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+
+# ===========================
+# LOGS
+# ===========================
+*.log
+logs/
+npm-debug.log*
+
+
+# ===========================
+# BUILD / ARTIFACTS
+# ===========================
+*.cache
+*.lock
+yarn-error.log
+pnpm-lock.yaml
