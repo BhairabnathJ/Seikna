@@ -67,6 +67,28 @@ class Database:
             return cursor.lastrowid
         finally:
             conn.close()
+    
+    def execute_write_in_transaction(
+        self,
+        conn: sqlite3.Connection,
+        query: str,
+        params: Optional[tuple] = None
+    ) -> int:
+        """
+        Execute write within an existing transaction.
+
+        DOES NOT commit - caller must commit via transaction manager.
+
+        Args:
+            conn: Active connection (from transaction context)
+            query: SQL query
+            params: Query parameters
+
+        Returns:
+            Last row ID
+        """
+        cursor = conn.execute(query, params or ())
+        return cursor.lastrowid
 
 
 # Global database instance

@@ -13,9 +13,9 @@ class StructureGenerator:
     """Generates course structure from verified claims."""
     
     def __init__(self):
-        prompt_file = Path(__file__).parent.parent.parent / "prompts" / "course_structure.txt"
-        with open(prompt_file, "r") as f:
-            self.prompt_template = f.read()
+        # Use prompt manager
+        from core.prompt_manager import prompt_manager
+        self.prompt_template = prompt_manager.get_prompt("course_structure")
     
     def build_course(
         self,

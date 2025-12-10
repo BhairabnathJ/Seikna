@@ -21,10 +21,30 @@ from services.processing.llm_expander import ChunkExpander
 from services.processing.course_builder import build_complete_course
 from services.extraction.consensus_builder import consensus_builder
 from core.database import db
+from core.transaction import transaction_manager
+import sqlite3
 
 
 class CourseCreationPipeline:
-    """Orchestrates the end-to-end course creation process."""
+    """
+    Orchestrates the end-to-end course creation process.
+
+    PUBLIC API (Entry Points):
+    - run_course_creation_pipeline() - Automatic source discovery
+    - run_pipeline_with_sources() - Explicit URL input
+
+    INTERNAL METHODS (Do not call directly):
+    - _process_sources_into_course() - Shared processing path
+    - _store_source() - Source persistence
+    - _store_transcript_transactional() - Transcript storage
+    - _store_chunks_transactional() - Chunk storage
+    - _store_expanded_chunks_transactional() - Expansion storage
+    - _store_claim_transactional() - Claim storage
+    - _store_consensus_claim_transactional() - Consensus storage
+    - _store_contradiction_transactional() - Contradiction storage
+    - _store_enhanced_course_transactional() - Course storage
+    - _section_to_dict() - Helper for JSON conversion
+    """
     
     def run_course_creation_pipeline(
         self,
@@ -56,6 +76,14 @@ class CourseCreationPipeline:
         Returns:
             course_id: ID of the created course
         """
+        # PRE-EXECUTION VALIDATION
+        from core.config_validator import config_validator, ConfigurationError
+        
+        validation = config_validator.validate_all()
+        if not validation["valid"]:
+            error_msg = "Configuration errors detected:\n" + "\n".join(validation["errors"])
+            raise ConfigurationError(error_msg)
+        
         if source_types is None:
             source_types = ["youtube", "article"]
 
@@ -172,11 +200,17 @@ class CourseCreationPipeline:
     def _process_sources_into_course(
         self, query: str, course_id: str, sources: List[Dict[str, Any]]
     ) -> None:
-        """Shared processing path that converts stored sources into a course."""
-        # STAGE 3: Transcription & Normalization
-        transcripts = []
+        """
+        Shared processing path that converts stored sources into a course.
+        
+        NOW WRAPPED IN TRANSACTION for atomicity.
+        """
+        # Wrap entire pipeline in transaction
+        with transaction_manager.transaction(isolation_level="IMMEDIATE") as conn:
+            # STAGE 3: Transcription & Normalization
+            transcripts = []
 
-        for source in sources:
+            for source in sources:
             try:
                 source_type = source.get(
                     "source_type", "youtube" if "youtube.com" in source.get("url", "") else "article"
@@ -210,8 +244,8 @@ class CourseCreationPipeline:
                 validation = validate_transcript(transcript)
                 if validation["is_valid"]:
                     transcripts.append(transcript)
-                    # Store in database
-                    self._store_transcript(transcript)
+                    # Store in database (within transaction)
+                    self._store_transcript_transactional(transcript, conn)
                 else:
                     print(
                         f"Warning: Transcript validation failed for {source.get('url')}: {validation.get('issues', [])}"
@@ -234,8 +268,8 @@ class CourseCreationPipeline:
             # Improve chunk quality
             chunks = rechunk_if_needed(chunks)
             all_chunks.extend(chunks)
-            # Store chunks
-            self._store_chunks(chunks, transcript.source_id)
+            # Store chunks (within transaction)
+            self._store_chunks_transactional(chunks, transcript.source_id, conn)
 
         if not all_chunks:
             raise ValueError("No chunks could be created from transcripts")
@@ -244,8 +278,8 @@ class CourseCreationPipeline:
         expander = ChunkExpander()
         expanded_chunks = expander.expand_batch(all_chunks)
 
-        # Store expanded chunks
-        self._store_expanded_chunks(expanded_chunks)
+        # Store expanded chunks (within transaction)
+        self._store_expanded_chunks_transactional(expanded_chunks, conn)
 
         # STAGE 6: Claim Extraction (from expanded chunks)
         # Build source_id map from chunks (chunk_id -> source_id)
@@ -269,16 +303,17 @@ class CourseCreationPipeline:
                         "timestamp_ms": None,  # Will be enhanced
                     }
                     all_claims.append(claim_data)
-                    # Store claim
-                    self._store_claim(claim_data)
+                    # Store claim (within transaction)
+                    self._store_claim_transactional(claim_data, conn)
 
         # STAGE 6.5: Consensus & Contradiction Detection
         consensus_results = consensus_builder.build_consensus(all_claims)
+
         for consensus in consensus_results.get("consensus_claims", []):
-            self._store_consensus_claim(consensus)
+            self._store_consensus_claim_transactional(consensus, conn)
 
         for contradiction in consensus_results.get("contradictions", []):
-            self._store_contradiction(contradiction)
+            self._store_contradiction_transactional(contradiction, conn)
 
         # STAGE 7 & 8: Course Building & Section Synthesis
         course_data = build_complete_course(
@@ -289,8 +324,11 @@ class CourseCreationPipeline:
             consensus_claims=consensus_results.get("consensus_claims", []),
         )
 
-        # STAGE 9: Store course and sections
-        self._store_enhanced_course(course_data, query, sources)
+        # STAGE 9: Store course and sections (within transaction)
+        self._store_enhanced_course_transactional(course_data, query, sources, conn)
+
+        # If we reach here, transaction commits automatically
+        # If any exception raised above, transaction rolls back
 
     def _store_source(self, source: Dict[str, Any]) -> Dict[str, Any]:
         """Persist a source and return the stored record (ensures source_id is valid)."""
@@ -350,6 +388,12 @@ class CourseCreationPipeline:
                     source.get("vct_tier"),
                 ),
             )
+
+        # Register cache write compensation
+        # If transaction rolls back, we need to invalidate cache entry
+        transaction_manager.register_compensation(
+            lambda: cache_manager.delete_source(source_url)  # Undo cache write
+        )
 
         # Keep cache in sync for future fetches
         cache_manager.save_source(
@@ -604,6 +648,260 @@ class CourseCreationPipeline:
                 (course_data["course_id"], source["source_id"])
             )
     
+    # ========== TRANSACTIONAL STORAGE METHODS ==========
+    
+    def _store_transcript_transactional(self, transcript, conn: sqlite3.Connection) -> None:
+        """Store RawTranscript within existing transaction."""
+        transcript_id = f"trans_{transcript.source_id}_{uuid.uuid4().hex[:8]}"
+
+        db.execute_write_in_transaction(
+            conn,
+            """
+            INSERT INTO raw_transcripts
+            (transcript_id, source_id, full_text, segment_count, word_count, language, quality_score, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                transcript_id,
+                transcript.source_id,
+                transcript.full_text,
+                len(transcript.segments),
+                transcript.word_count,
+                transcript.language,
+                0.8,
+                json.dumps(transcript.metadata),
+            )
+        )
+
+        # Store segments
+        for i, segment in enumerate(transcript.segments):
+            db.execute_write_in_transaction(
+                conn,
+                """
+                INSERT INTO transcript_segments
+                (segment_id, transcript_id, segment_index, text, start_time_ms, end_time_ms, metadata)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    segment.segment_id or f"seg_{uuid.uuid4().hex[:8]}",
+                    transcript_id,
+                    i,
+                    segment.text,
+                    segment.start_time_ms,
+                    segment.end_time_ms,
+                    json.dumps(segment.metadata),
+                )
+            )
+
+    def _store_chunks_transactional(self, chunks, source_id: str, conn: sqlite3.Connection) -> None:
+        """Store TranscriptChunks within existing transaction."""
+        for chunk in chunks:
+            transcript_id = chunk.chunk_id.split('_')[1] if '_' in chunk.chunk_id else None
+
+            db.execute_write_in_transaction(
+                conn,
+                """
+                INSERT INTO transcript_chunks
+                (chunk_id, transcript_id, source_id, chunk_index, text, word_count,
+                 start_time_ms, end_time_ms, topic_keywords, semantic_density,
+                 coherence_score, completeness_score, previous_chunk_id, next_chunk_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    chunk.chunk_id,
+                    transcript_id or source_id,
+                    source_id,
+                    chunk.chunk_index,
+                    chunk.text,
+                    chunk.word_count,
+                    chunk.start_time_ms,
+                    chunk.end_time_ms,
+                    json.dumps(chunk.topic_keywords),
+                    chunk.semantic_density,
+                    chunk.coherence_score,
+                    chunk.completeness_score,
+                    chunk.previous_chunk_id,
+                    chunk.next_chunk_id,
+                )
+            )
+
+    def _store_expanded_chunks_transactional(self, expanded_chunks, conn: sqlite3.Connection) -> None:
+        """Store ExpandedChunks within existing transaction."""
+        for expanded in expanded_chunks:
+            db.execute_write_in_transaction(
+                conn,
+                """
+                INSERT INTO expanded_chunks
+                (expanded_id, chunk_id, original_text, expanded_explanation, 
+                 key_concepts, definitions, examples, prerequisites, 
+                 difficulty_level, cognitive_load, llm_model, token_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    expanded.chunk_id,
+                    expanded.source_chunk_id,
+                    expanded.original_text,
+                    expanded.expanded_explanation,
+                    json.dumps(expanded.key_concepts),
+                    json.dumps(expanded.definitions),
+                    json.dumps(expanded.examples),
+                    json.dumps(expanded.prerequisites),
+                    expanded.difficulty_level,
+                    expanded.cognitive_load,
+                    expanded.llm_model,
+                    expanded.token_count,
+                )
+            )
+
+    def _store_claim_transactional(self, claim: Dict[str, Any], conn: sqlite3.Connection) -> None:
+        """Store a claim within existing transaction."""
+        db.execute_write_in_transaction(
+            conn,
+            """
+            INSERT OR IGNORE INTO claims
+            (claim_id, source_id, claim_type, subject, predicate, object, timestamp_ms, confidence)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                claim["claim_id"],
+                claim["source_id"],
+                claim["claim_type"],
+                claim["subject"],
+                claim["predicate"],
+                claim["object"],
+                claim["timestamp_ms"],
+                claim["confidence"],
+            )
+        )
+
+    def _store_consensus_claim_transactional(self, consensus: Dict[str, Any], conn: sqlite3.Connection) -> None:
+        """Store a consensus claim within existing transaction."""
+        db.execute_write_in_transaction(
+            conn,
+            """
+            INSERT OR IGNORE INTO consensus_claims
+            (consensus_id, subject, predicate, object, support_claim_ids, support_sources, support_count, confidence)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                consensus["consensus_id"],
+                consensus.get("subject"),
+                consensus.get("predicate"),
+                consensus.get("object"),
+                json.dumps(consensus.get("support_claim_ids", [])),
+                json.dumps(consensus.get("support_sources", [])),
+                consensus.get("support_count"),
+                consensus.get("confidence"),
+            ),
+        )
+
+    def _store_contradiction_transactional(self, contradiction: Dict[str, Any], conn: sqlite3.Connection) -> None:
+        """Store a contradiction within existing transaction."""
+        db.execute_write_in_transaction(
+            conn,
+            """
+            INSERT OR IGNORE INTO contradictions
+            (contradiction_id, claim_id_1, claim_id_2, reasoning)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                contradiction["contradiction_id"],
+                contradiction["claim_id_1"],
+                contradiction["claim_id_2"],
+                contradiction.get("reasoning", ""),
+            ),
+        )
+
+    def _store_enhanced_course_transactional(
+        self,
+        course_data: Dict[str, Any],
+        query: str,
+        sources: List[Dict[str, Any]],
+        conn: sqlite3.Connection,
+    ) -> None:
+        """Store enhanced course with sections within existing transaction."""
+        # Store course
+        db.execute_write_in_transaction(
+            conn,
+            """
+            INSERT INTO courses (course_id, query, title, description, structure)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                course_data["course_id"],
+                query,
+                course_data["title"],
+                course_data["description"],
+                json.dumps({
+                    "sections": [self._section_to_dict(s) for s in course_data["sections"]],
+                    "metadata": course_data["metadata"],
+                }),
+            )
+        )
+        
+        # Store sections
+        for section in course_data["sections"]:
+            db.execute_write_in_transaction(
+                conn,
+                """
+                INSERT INTO course_sections
+                (section_id, course_id, section_index, title, subtitle, content,
+                 key_takeaways, glossary_terms, practice_questions,
+                 estimated_reading_minutes, difficulty_level,
+                 coherence_score, coverage_score, confidence_score,
+                 has_contradictions, controversy_notes)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    section.section_id,
+                    section.course_id,
+                    section.section_index,
+                    section.title,
+                    section.subtitle,
+                    section.content,
+                    json.dumps(section.key_takeaways),
+                    json.dumps(section.glossary_terms),
+                    json.dumps(section.practice_questions),
+                    section.estimated_reading_time_minutes,
+                    section.difficulty_level,
+                    section.coherence_score,
+                    section.coverage_score,
+                    section.confidence_score,
+                    section.has_contradictions,
+                    section.controversy_notes,
+                )
+            )
+            
+            # Store citations
+            for citation in section.citations:
+                db.execute_write_in_transaction(
+                    conn,
+                    """
+                    INSERT INTO section_citations
+                    (citation_id, section_id, source_id, timestamp_ms, timestamp_formatted, relevance_score)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        f"cite_{uuid.uuid4().hex[:8]}",
+                        section.section_id,
+                        citation.source_id,
+                        citation.timestamp_ms,
+                        citation.timestamp_formatted,
+                        citation.relevance_score,
+                    )
+                )
+        
+        # Link sources
+        for source in sources:
+            db.execute_write_in_transaction(
+                conn,
+                """
+                INSERT OR IGNORE INTO course_sources (course_id, source_id)
+                VALUES (?, ?)
+                """,
+                (course_data["course_id"], source["source_id"])
+            )
+    
     def _section_to_dict(self, section) -> Dict[str, Any]:
         """Convert CourseSection to dictionary for JSON storage."""
         return {
@@ -612,39 +910,6 @@ class CourseCreationPipeline:
             "content": section.content,
             "sources": section.primary_sources,
         }
-    
-    def _store_course(
-        self,
-        course_id: str,
-        query: str,
-        structure: Dict[str, Any],
-        source_ids: List[str],
-    ) -> None:
-        """Store course in database (legacy method for compatibility)."""
-        # Insert course
-        db.execute_write(
-            """
-            INSERT INTO courses (course_id, query, title, description, structure)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                course_id,
-                query,
-                structure.get("title", ""),
-                structure.get("description", ""),
-                json.dumps(structure),
-            )
-        )
-        
-        # Link sources
-        for source_id in source_ids:
-            db.execute_write(
-                """
-                INSERT OR IGNORE INTO course_sources (course_id, source_id)
-                VALUES (?, ?)
-                """,
-                (course_id, source_id)
-            )
 
 
 # Global pipeline instance

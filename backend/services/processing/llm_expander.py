@@ -36,20 +36,9 @@ class ChunkExpander:
         self.temperature = temperature
         self.max_tokens = max_tokens
         
-        # Load prompt template
-        prompt_file = Path(__file__).parent.parent.parent / "prompts" / "chunk_expansion.txt"
-        if prompt_file.exists():
-            with open(prompt_file, "r") as f:
-                self.prompt_template = f.read()
-        else:
-            # Fallback template
-            self.prompt_template = """Expand this educational content chunk:
-
-{chunk_text}
-
-Topic: {topic}
-
-Provide expanded explanation, key concepts, definitions, examples, prerequisites, and claims in JSON format."""
+        # Use prompt manager
+        from core.prompt_manager import prompt_manager
+        self.prompt_template = prompt_manager.get_prompt("chunk_expansion")
     
     def expand_chunk(
         self,

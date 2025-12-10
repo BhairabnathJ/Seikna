@@ -60,6 +60,13 @@ class CacheManager:
             """,
             (source_id, source_type, url, title, transcript, metadata_json, vct_tier)
         )
+    
+    def delete_source(self, url: str) -> None:
+        """Delete source from cache (compensation handler)."""
+        db.execute_write(
+            "DELETE FROM sources WHERE url = ?",
+            (url,)
+        )
 
 
 # Global cache manager instance

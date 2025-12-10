@@ -13,9 +13,9 @@ class ClaimExtractor:
     """Extracts atomic knowledge claims from transcripts."""
     
     def __init__(self):
-        prompt_file = Path(__file__).parent.parent.parent / "prompts" / "claim_extraction.txt"
-        with open(prompt_file, "r") as f:
-            self.prompt_template = f.read()
+        # Use prompt manager instead of direct file loading
+        from core.prompt_manager import prompt_manager
+        self.prompt_template = prompt_manager.get_prompt("claim_extraction")
     
     def extract_claims(
         self,
