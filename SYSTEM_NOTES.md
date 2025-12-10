@@ -5310,6 +5310,17 @@ CODEX IMPLEMENTATION
 - Unified both pipeline entry points to share the same normalization → chunking → expansion → consensus-aware course builder path, added a shared processing helper, and enforced stable `source_id` creation when inserting new sources.
 - Next steps: wrap multi-table pipeline writes in DB transactions, expose consensus/contradiction data through the API, surface consensus/conflict indicators in the frontend course views, and proceed with the queued Phase 2 (vision), Phase 3 (gamification), and Phase 4 (RAG chat) milestones after transaction hardening.
 
+Actionable tasks from recommendations (implementation queue)
+- Pipeline robustness: add transactional wrappers around the ingestion → extraction → course-build writes in `backend/core/pipeline.py` (e.g., helpers around `_store_transcript`, `_store_chunks`, `_store_claims`, and course persistence) so partial failures roll back consistently.
+- Course builder alignment: keep both entry points on `_process_sources_into_course`; remove any legacy divergent paths and ensure the shared path calls the same section synthesis utilities in `backend/services/processing/course_builder.py`.
+- Consensus integration: thread consensus outputs into section scoring everywhere (verify `calculate_section_scores` uses stored consensus records) and add unit coverage for contradiction/conflict flags.
+- Prompt/LLM resilience: add configuration validation and explicit error handling around prompt/model loading in `backend/services/extraction/claim_extractor.py`, `chunk_expander.py`, and related modules to surface missing prompt files or model names early.
+- API exposure: extend FastAPI routes to return consensus claims, contradiction details, and section-level citation metadata; ensure response schemas in `backend/api` reflect the new fields.
+- Frontend visibility: update course viewer components to render consensus confidence, contradictions, and citation lists; add empty/error states for source discovery failures and missing transcripts.
+- Vision features (Phase 2): implement frame extraction via `frame_extractor` (ffmpeg), VCT classification, and visual claim extraction using LLaVA; persist frames/visual claims and surface frame-based citations in course sections.
+- Gamification (Phase 3): wire XP, badges, and skill tree progression to existing tables; add backend endpoints and frontend dashboard components for progress tracking.
+- RAG chat (Phase 4): generate embeddings for course sections, build retriever/query APIs, and connect the chat panel using the chatbot prompt with strict context-only responses.
+
 ---
 
 **END OF SYSTEM NOTES**
