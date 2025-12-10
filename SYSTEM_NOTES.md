@@ -7158,4 +7158,1291 @@ echo "✅ No legacy method calls found"
 
 ---
 
+# TIER 2 DATA EXPOSURE - ARCHITECTURAL SPECIFICATIONS
+
+**Purpose:** Surface consensus claims, contradictions, and citation metadata through the API layer and integrate consensus confidence scoring into course quality metrics.
+
+**Scope:** Two architectural domains:
+1. **Consensus Integration** - Thread consensus outputs into section scoring and validation
+2. **API Exposure** - Extend FastAPI routes to return consensus claims, contradictions, and citation details
+
+---
+
+# 23. CONSENSUS INTEGRATION - SCORING & TESTING
+
+## 23.1 Problem Analysis
+
+### Current State (Post-Codex Implementation)
+
+**Working Components:**
+1. `ConsensusBuilder` (`backend/services/extraction/consensus_builder.py`) successfully:
+   - Clusters similar claims using embeddings
+   - Generates consensus claims with confidence scores (0.0-1.0)
+   - Detects simple contradictions using negation markers
+   - Returns: `{"consensus_claims": [...], "contradictions": [...]}`
+
+2. Database schema (`backend/db/schema.sql`) includes:
+   - `consensus_claims` table with `confidence` field
+   - `contradictions` table with `reasoning` field
+   - `course_sections` table with `confidence_score`, `has_contradictions`, `controversy_notes`
+
+3. Pipeline integration (`backend/core/pipeline.py`):
+   - Stage 6.5 calls `consensus_builder.build_consensus()`
+   - Stores consensus claims and contradictions in database
+   - ✅ Data is being generated and persisted
+
+### Critical Gaps
+
+**Gap 1: Consensus Not Threading Into Section Scoring**
+
+Current section scoring (`backend/services/processing/course_builder.py`):
+```python
+# Section confidence is calculated from:
+- Coverage score (how well sources cover topic)
+- Coherence score (how well section flows)
+# BUT NOT from consensus confidence!
+```
+
+**Problem:** High consensus confidence (e.g., 5 sources agree on a fact) does NOT boost section quality scores. Low consensus (e.g., contradictory claims) does NOT lower scores.
+
+**Impact:**
+- Sections with strong cross-source agreement score the same as sections with weak/contradictory evidence
+- Quality metrics don't reflect epistemic confidence
+- No programmatic detection of controversial topics
+
+**Gap 2: Contradictions Not Flagging Sections**
+
+Current contradiction handling:
+- Contradictions are detected and stored in database
+- `course_sections.has_contradictions` field exists BUT is always `FALSE` (never set)
+- `course_sections.controversy_notes` field exists BUT is always `NULL` (never populated)
+
+**Problem:** When contradictions are found across sources, the system:
+1. Stores them in `contradictions` table ✅
+2. Does NOT mark affected sections with `has_contradictions = TRUE` ❌
+3. Does NOT populate `controversy_notes` with explanation ❌
+
+**Impact:**
+- Users cannot distinguish high-confidence facts from disputed claims
+- Frontend cannot display "⚠️ Conflicting Information" warnings
+- Educational integrity compromised (students unaware of controversies)
+
+**Gap 3: No Unit Tests for Consensus Logic**
+
+Current test coverage (`backend/tests/`):
+- No tests for `ConsensusBuilder`
+- No tests for contradiction detection
+- No tests for consensus-to-section threading
+
+**Problem:** Consensus builder has complex logic:
+- Embedding clustering with similarity threshold (0.85)
+- Fallback embeddings when Ollama fails
+- Negation marker detection (`["not ", "no ", "false", "never"]`)
+- Edge cases: empty claims, identical claims, partial contradictions
+
+**Impact:**
+- Refactoring could break consensus logic silently
+- Threshold tuning (e.g., changing 0.85 to 0.90) has unknown effects
+- Production bugs in claim clustering would go undetected until user reports
+
+---
+
+## 23.2 Architecture Solution
+
+### Layer 1: Consensus-Aware Section Scoring
+
+**New Component: `ConsensusScorer` (`backend/services/processing/consensus_scorer.py`)**
+
+```python
+class ConsensusScorer:
+    """Adjusts section confidence scores based on consensus claim data."""
+
+    def calculate_consensus_adjusted_score(
+        self,
+        base_confidence: float,  # From coverage/coherence
+        section_claims: List[Dict],  # Claims cited in this section
+        consensus_claims: List[Dict],  # All consensus claims
+        contradictions: List[Dict],  # All contradictions
+    ) -> Tuple[float, bool, Optional[str]]:
+        """
+        Returns: (adjusted_score, has_contradictions, controversy_notes)
+
+        Scoring Rules:
+        1. High Consensus Boost: If 80%+ of section claims have consensus_confidence > 0.8,
+           boost base_confidence by +0.1 (capped at 1.0)
+
+        2. Contradiction Penalty: If ANY claim in section has contradiction,
+           reduce base_confidence by -0.15 per contradiction (min 0.3)
+
+        3. Mixed Evidence: If claims have mixed confidence (some high, some low),
+           no adjustment (indicates nuanced topic)
+        """
+
+    def identify_section_contradictions(
+        self,
+        section_claims: List[str],  # claim_ids cited in section
+        all_contradictions: List[Dict],
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Returns: (has_contradictions, controversy_notes)
+
+        Logic:
+        - Check if ANY claim in section appears in contradictions table
+        - Generate human-readable explanation:
+          "This section contains conflicting information: claim A states X,
+           but claim B states Y (from different sources)."
+        """
+```
+
+**Integration Point:** Modify `_build_section()` in `backend/services/processing/course_builder.py`:
+
+```python
+# BEFORE (current):
+section = {
+    "section_id": section_id,
+    "confidence_score": base_confidence,  # Only coverage + coherence
+    "has_contradictions": False,  # Always false
+    "controversy_notes": None,  # Always null
+}
+
+# AFTER (Tier 2):
+from services.processing.consensus_scorer import consensus_scorer
+
+adjusted_score, has_contrad, notes = consensus_scorer.calculate_consensus_adjusted_score(
+    base_confidence=base_confidence,
+    section_claims=section_claim_ids,  # New: track which claims cited in section
+    consensus_claims=consensus_claims,  # Passed from pipeline
+    contradictions=contradictions,  # Passed from pipeline
+)
+
+section = {
+    "section_id": section_id,
+    "confidence_score": adjusted_score,  # Now includes consensus
+    "has_contradictions": has_contrad,  # True if contradictions found
+    "controversy_notes": notes,  # Human-readable explanation
+}
+```
+
+---
+
+### Layer 2: Claim-to-Section Mapping
+
+**New Database Table: `section_claims` (Add to `backend/db/schema.sql`)**
+
+```sql
+-- Link sections to the specific claims they cite
+CREATE TABLE IF NOT EXISTS section_claims (
+    section_id TEXT NOT NULL,
+    claim_id TEXT NOT NULL,
+    PRIMARY KEY (section_id, claim_id),
+    FOREIGN KEY (section_id) REFERENCES course_sections(section_id),
+    FOREIGN KEY (claim_id) REFERENCES claims(claim_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_section_claims_section ON section_claims(section_id);
+CREATE INDEX IF NOT EXISTS idx_section_claims_claim ON section_claims(claim_id);
+```
+
+**Purpose:** Enable `ConsensusScorer` to:
+1. Find all claims cited in a section
+2. Check if those claims have consensus support
+3. Check if those claims are involved in contradictions
+
+**Population Logic:** Modify `_build_section()` to track claim provenance:
+
+```python
+# When building section content, track which claims contributed
+section_claim_ids = []
+for chunk in chunks:
+    for claim in chunk.claims:
+        if claim.text in section.content:  # If claim text appears in section
+            section_claim_ids.append(claim.claim_id)
+
+# Store mapping
+for claim_id in section_claim_ids:
+    db.execute_write(
+        "INSERT INTO section_claims (section_id, claim_id) VALUES (?, ?)",
+        (section_id, claim_id)
+    )
+```
+
+---
+
+### Layer 3: Comprehensive Unit Tests
+
+**New Test File: `backend/tests/test_consensus_builder.py`**
+
+```python
+import pytest
+from services.extraction.consensus_builder import ConsensusBuilder
+
+class TestConsensusBuilder:
+
+    def test_empty_claims_returns_empty_consensus(self):
+        """Empty input should return empty consensus and contradictions."""
+        builder = ConsensusBuilder()
+        result = builder.build_consensus([])
+        assert result == {"consensus_claims": [], "contradictions": []}
+
+    def test_identical_claims_cluster_together(self):
+        """Claims with identical SPO should cluster into single consensus."""
+        claims = [
+            {"claim_id": "c1", "subject": "Python", "predicate": "is", "object": "interpreted"},
+            {"claim_id": "c2", "subject": "Python", "predicate": "is", "object": "interpreted"},
+        ]
+        builder = ConsensusBuilder(similarity_threshold=0.85)
+        result = builder.build_consensus(claims)
+
+        assert len(result["consensus_claims"]) == 1
+        assert result["consensus_claims"][0]["support_count"] == 2
+        assert set(result["consensus_claims"][0]["support_claim_ids"]) == {"c1", "c2"}
+
+    def test_contradictory_claims_flagged(self):
+        """Claims with negation markers should be detected as contradictions."""
+        claims = [
+            {"claim_id": "c1", "subject": "Python", "predicate": "is", "object": "type-safe"},
+            {"claim_id": "c2", "subject": "Python", "predicate": "is", "object": "not type-safe"},
+        ]
+        builder = ConsensusBuilder()
+        result = builder.build_consensus(claims)
+
+        assert len(result["contradictions"]) >= 1
+        contr = result["contradictions"][0]
+        assert set([contr["claim_id_1"], contr["claim_id_2"]]) == {"c1", "c2"}
+        assert "type-safe" in contr["reasoning"].lower()
+
+    def test_similarity_threshold_controls_clustering(self):
+        """Lower threshold should cluster more aggressively."""
+        claims = [
+            {"claim_id": "c1", "subject": "Python", "predicate": "uses", "object": "indentation"},
+            {"claim_id": "c2", "subject": "Python", "predicate": "requires", "object": "whitespace"},
+        ]
+
+        strict_builder = ConsensusBuilder(similarity_threshold=0.95)
+        lenient_builder = ConsensusBuilder(similarity_threshold=0.70)
+
+        strict_result = strict_builder.build_consensus(claims)
+        lenient_result = lenient_builder.build_consensus(claims)
+
+        # Strict: likely 2 separate consensus claims
+        # Lenient: likely 1 merged consensus claim
+        assert len(strict_result["consensus_claims"]) >= len(lenient_result["consensus_claims"])
+
+    def test_embedding_failure_uses_fallback(self, monkeypatch):
+        """When Ollama embedding fails, should use fallback and continue."""
+        def mock_embedding_error(text):
+            raise Exception("Ollama connection failed")
+
+        monkeypatch.setattr("core.ollama_client.ollama.generate_embedding", mock_embedding_error)
+
+        builder = ConsensusBuilder()
+        claims = [{"claim_id": "c1", "subject": "Test", "predicate": "is", "object": "valid"}]
+
+        # Should not raise, should use fallback embedding
+        result = builder.build_consensus(claims)
+        assert len(result["consensus_claims"]) == 1
+
+    def test_confidence_score_averages_support_claims(self):
+        """Consensus confidence should average individual claim confidences."""
+        claims = [
+            {"claim_id": "c1", "subject": "A", "predicate": "B", "object": "C", "confidence": 0.9},
+            {"claim_id": "c2", "subject": "A", "predicate": "B", "object": "C", "confidence": 0.7},
+        ]
+        builder = ConsensusBuilder()
+        result = builder.build_consensus(claims)
+
+        consensus = result["consensus_claims"][0]
+        # Average of 0.9 and 0.7 = 0.8
+        assert consensus["confidence"] == pytest.approx(0.8, abs=0.01)
+```
+
+**New Test File: `backend/tests/test_consensus_scorer.py`**
+
+```python
+import pytest
+from services.processing.consensus_scorer import ConsensusScorer
+
+class TestConsensusScorer:
+
+    def test_high_consensus_boosts_score(self):
+        """Sections with high consensus should get +0.1 boost."""
+        scorer = ConsensusScorer()
+
+        consensus_claims = [
+            {"consensus_id": "cons1", "support_claim_ids": ["c1", "c2"], "confidence": 0.9}
+        ]
+        section_claims = ["c1", "c2"]  # Both claims have high consensus
+
+        adjusted, _, _ = scorer.calculate_consensus_adjusted_score(
+            base_confidence=0.7,
+            section_claims=section_claims,
+            consensus_claims=consensus_claims,
+            contradictions=[]
+        )
+
+        assert adjusted == pytest.approx(0.8, abs=0.01)  # 0.7 + 0.1
+
+    def test_contradictions_reduce_score(self):
+        """Sections with contradictions should get -0.15 penalty per contradiction."""
+        scorer = ConsensusScorer()
+
+        contradictions = [
+            {"contradiction_id": "contr1", "claim_id_1": "c1", "claim_id_2": "c2", "reasoning": "Conflict"}
+        ]
+        section_claims = ["c1"]  # Section cites contradicted claim
+
+        adjusted, has_contr, notes = scorer.calculate_consensus_adjusted_score(
+            base_confidence=0.8,
+            section_claims=section_claims,
+            consensus_claims=[],
+            contradictions=contradictions
+        )
+
+        assert adjusted == pytest.approx(0.65, abs=0.01)  # 0.8 - 0.15
+        assert has_contr is True
+        assert notes is not None
+        assert "conflict" in notes.lower()
+
+    def test_mixed_evidence_no_adjustment(self):
+        """Sections with both high and low consensus should not adjust."""
+        scorer = ConsensusScorer()
+
+        consensus_claims = [
+            {"consensus_id": "cons1", "support_claim_ids": ["c1"], "confidence": 0.9},
+            {"consensus_id": "cons2", "support_claim_ids": ["c2"], "confidence": 0.4},
+        ]
+        section_claims = ["c1", "c2"]  # Mixed confidence
+
+        adjusted, _, _ = scorer.calculate_consensus_adjusted_score(
+            base_confidence=0.7,
+            section_claims=section_claims,
+            consensus_claims=consensus_claims,
+            contradictions=[]
+        )
+
+        assert adjusted == pytest.approx(0.7, abs=0.01)  # No change
+```
+
+**New Test File: `backend/tests/test_pipeline_integration.py`**
+
+```python
+import pytest
+from core.pipeline import pipeline
+
+class TestPipelineConsensusIntegration:
+
+    def test_end_to_end_consensus_flows_to_sections(self):
+        """Full pipeline should propagate consensus to section scores."""
+        course_id = pipeline.run_pipeline_with_sources(
+            query="Python decorators",
+            youtube_urls=["https://www.youtube.com/watch?v=example1"],
+            article_urls=["https://example.com/decorators"]
+        )
+
+        # Fetch course sections from database
+        sections = db.execute(
+            "SELECT confidence_score, has_contradictions FROM course_sections WHERE course_id = ?",
+            (course_id,)
+        )
+
+        # At least one section should have non-default confidence
+        assert any(s["confidence_score"] != 0.5 for s in sections)
+
+        # If contradictions exist, should be flagged
+        contradictions = db.execute("SELECT * FROM contradictions WHERE claim_id_1 IN (SELECT claim_id FROM claims)")
+        if contradictions:
+            assert any(s["has_contradictions"] for s in sections)
+```
+
+---
+
+### Layer 4: Integration Roadmap
+
+**File Modifications Required:**
+
+1. **`backend/services/processing/course_builder.py`**
+   - Import `ConsensusScorer`
+   - Modify `_build_section()` to accept `consensus_claims` and `contradictions` parameters
+   - Track claim-to-section mapping during content generation
+   - Call `consensus_scorer.calculate_consensus_adjusted_score()` before finalizing section
+   - Populate `has_contradictions` and `controversy_notes` fields
+
+2. **`backend/core/pipeline.py`**
+   - In `_process_sources_into_course()`, pass consensus results to `build_complete_course()`
+   - Ensure consensus claims and contradictions are available during section building
+
+3. **`backend/db/schema.sql`**
+   - Add `section_claims` table (SQL above)
+   - Create indexes for efficient claim lookups
+
+4. **New Files:**
+   - `backend/services/processing/consensus_scorer.py` (new class)
+   - `backend/tests/test_consensus_builder.py` (unit tests)
+   - `backend/tests/test_consensus_scorer.py` (unit tests)
+   - `backend/tests/test_pipeline_integration.py` (integration tests)
+
+---
+
+## 23.3 Testing Requirements
+
+**Unit Test Coverage (Target: 90%+)**
+
+**ConsensusBuilder Tests:**
+- ✅ Empty claims input
+- ✅ Identical claims clustering
+- ✅ Contradictory claims detection
+- ✅ Similarity threshold tuning
+- ✅ Embedding fallback on Ollama failure
+- ✅ Confidence score averaging
+- ✅ Edge case: claims with missing fields (no subject/predicate/object)
+- ✅ Edge case: claims with very long text (>1000 chars)
+
+**ConsensusScorer Tests:**
+- ✅ High consensus boost (+0.1)
+- ✅ Contradiction penalty (-0.15 per contradiction)
+- ✅ Mixed evidence (no adjustment)
+- ✅ Boundary case: base_confidence = 1.0 (should not boost above 1.0)
+- ✅ Boundary case: base_confidence = 0.5, 5 contradictions (should not go below 0.3)
+- ✅ Controversy notes generation (readable format)
+
+**Integration Tests:**
+- ✅ End-to-end pipeline propagates consensus to sections
+- ✅ Sections with contradictions have `has_contradictions = TRUE`
+- ✅ Controversy notes are populated when contradictions exist
+- ✅ Section confidence scores differ based on consensus strength
+
+---
+
+## 23.4 Acceptance Criteria
+
+**Consensus Integration:**
+- ✅ Section confidence scores reflect consensus strength (high consensus = higher score)
+- ✅ Sections with contradictions marked with `has_contradictions = TRUE`
+- ✅ Controversy notes populated with human-readable explanations
+- ✅ Claim-to-section mapping stored in `section_claims` table
+- ✅ Consensus scoring does not break existing pipeline (backwards compatible)
+
+**Testing:**
+- ✅ Unit test coverage ≥90% for ConsensusBuilder
+- ✅ Unit test coverage ≥90% for ConsensusScorer
+- ✅ Integration tests pass (pipeline propagates consensus correctly)
+- ✅ All tests run in <10 seconds (fast feedback loop)
+
+**Quality:**
+- ✅ No degradation in pipeline performance (consensus scoring adds <100ms overhead)
+- ✅ Consensus scoring documented in code comments
+- ✅ Test cases cover edge cases (empty claims, missing fields, Ollama failures)
+
+---
+
+# 24. API EXPOSURE - CONSENSUS & CONTRADICTION SCHEMAS
+
+## 24.1 Problem Analysis
+
+### Current API Response Structure
+
+**GET `/api/v1/courses/{course_id}` Response:**
+
+```json
+{
+  "course_id": "course_abc123",
+  "title": "Introduction to Python Decorators",
+  "description": "Learn how decorators work...",
+  "metadata": {
+    "source_count": 3,
+    "estimated_time": "4 hours"
+  },
+  "sections": [
+    {
+      "id": "section_xyz",
+      "title": "What are Decorators?",
+      "content": "Decorators are functions that modify...",
+      "sources": ["source_1", "source_2"]
+    }
+  ],
+  "glossary": [
+    {"term": "Decorator", "definition": "A function that wraps..."}
+  ]
+}
+```
+
+**Critical Gaps:**
+
+1. **No Consensus Data Exposed**
+   - `sections[].sources` only lists source IDs (e.g., `"source_1"`)
+   - No information about which claims have cross-source agreement
+   - No confidence scores visible to frontend
+
+2. **No Contradiction Data Exposed**
+   - `sections[].has_contradictions` exists in DB but not in API response
+   - No `controversy_notes` exposed
+   - Frontend cannot display "⚠️ Conflicting Information" warnings
+
+3. **Citation Metadata Incomplete**
+   - `sections[].sources` is just an array of IDs
+   - No timestamps (for YouTube videos)
+   - No relevance scores
+   - No way to deep-link to exact timestamp in video
+
+**Impact:**
+- **Frontend cannot distinguish facts from opinions** - No way to show "Confirmed by 5 sources" vs "Mentioned by 1 source"
+- **Educational integrity compromised** - Controversial topics appear as settled facts
+- **Poor user experience** - No way to verify claims or jump to source timestamps
+- **Missed engagement opportunity** - Cannot highlight high-confidence sections as "Verified Content"
+
+---
+
+## 24.2 Architecture Solution
+
+### Layer 1: Enhanced Section Response Model
+
+**Modify `backend/api/models/responses.py`:**
+
+```python
+from pydantic import BaseModel, Field
+from typing import List, Optional
+
+class ConsensusClaim(BaseModel):
+    """Consensus claim with cross-source support."""
+    consensus_id: str
+    subject: str
+    predicate: str
+    object: str
+    confidence: float = Field(ge=0.0, le=1.0, description="Confidence score (0.0-1.0)")
+    support_count: int = Field(ge=1, description="Number of sources supporting this claim")
+    support_sources: List[str] = Field(description="Source IDs that support this claim")
+
+class Contradiction(BaseModel):
+    """Contradictory claims between sources."""
+    contradiction_id: str
+    claim_id_1: str
+    claim_id_2: str
+    reasoning: str = Field(description="Human-readable explanation of the conflict")
+
+class Citation(BaseModel):
+    """Enhanced citation with timestamp and relevance."""
+    source_id: str
+    source_type: str = Field(description="'youtube' or 'article'")
+    source_title: Optional[str] = None
+    timestamp_ms: Optional[int] = Field(default=None, description="Milliseconds into video")
+    timestamp_formatted: Optional[str] = Field(default=None, description="e.g., '12:34'")
+    relevance_score: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+
+class Section(BaseModel):
+    """Enhanced course section with consensus data."""
+    id: str
+    title: str
+    content: str
+
+    # NEW: Consensus data
+    confidence_score: float = Field(ge=0.0, le=1.0, description="Section quality score")
+    has_contradictions: bool = Field(default=False)
+    controversy_notes: Optional[str] = Field(default=None)
+
+    # NEW: Enhanced citations
+    citations: List[Citation] = Field(default_factory=list)
+
+    # NEW: Consensus claims cited in this section
+    consensus_claims: List[ConsensusClaim] = Field(default_factory=list)
+
+    # NEW: Contradictions affecting this section
+    contradictions: List[Contradiction] = Field(default_factory=list)
+
+class CourseResponse(BaseModel):
+    """Enhanced course response with consensus data."""
+    course_id: str
+    title: str
+    description: str
+    metadata: SourceMetadata
+    sections: List[Section]  # Now includes consensus data
+    glossary: List[GlossaryTerm] = []
+
+    # NEW: Course-level consensus summary
+    total_consensus_claims: int = Field(default=0, description="Total consensus claims across all sections")
+    total_contradictions: int = Field(default=0, description="Total contradictions found")
+    avg_section_confidence: float = Field(default=0.0, ge=0.0, le=1.0, description="Average confidence across sections")
+```
+
+---
+
+### Layer 2: Enhanced Course Retrieval Endpoint
+
+**Modify `backend/api/routes/courses.py` GET `/{course_id}` endpoint:**
+
+```python
+@router.get("/{course_id}", response_model=CourseResponse)
+async def get_course(course_id: str):
+    """Fetch complete course structure with consensus data."""
+
+    # [Existing code: fetch course, sections]
+
+    # NEW: Fetch consensus claims and contradictions
+    all_consensus_claims = []
+    all_contradictions = []
+
+    for section in sections:
+        section_id = section.id
+
+        # Get claims cited in this section
+        section_claim_ids = db.execute(
+            "SELECT claim_id FROM section_claims WHERE section_id = ?",
+            (section_id,)
+        )
+        claim_ids = [row["claim_id"] for row in section_claim_ids] if section_claim_ids else []
+
+        # Get consensus claims for these claims
+        if claim_ids:
+            # Find consensus claims that include these claim IDs
+            consensus_results = db.execute(
+                "SELECT * FROM consensus_claims WHERE support_claim_ids LIKE ?",
+                (f'%{claim_ids[0]}%',)  # Simplified; actual impl needs JSON parsing
+            )
+
+            section_consensus = [
+                ConsensusClaim(
+                    consensus_id=row["consensus_id"],
+                    subject=row["subject"],
+                    predicate=row["predicate"],
+                    object=row["object"],
+                    confidence=row["confidence"],
+                    support_count=row["support_count"],
+                    support_sources=json.loads(row["support_sources"])
+                )
+                for row in consensus_results
+            ]
+
+            # Get contradictions involving these claims
+            contradiction_results = db.execute(
+                """
+                SELECT * FROM contradictions
+                WHERE claim_id_1 IN ({placeholders}) OR claim_id_2 IN ({placeholders})
+                """.format(placeholders=",".join(["?"] * len(claim_ids))),
+                (*claim_ids, *claim_ids)
+            )
+
+            section_contradictions = [
+                Contradiction(
+                    contradiction_id=row["contradiction_id"],
+                    claim_id_1=row["claim_id_1"],
+                    claim_id_2=row["claim_id_2"],
+                    reasoning=row["reasoning"]
+                )
+                for row in contradiction_results
+            ]
+        else:
+            section_consensus = []
+            section_contradictions = []
+
+        # Get enhanced citations from section_citations table
+        citation_results = db.execute(
+            """
+            SELECT sc.*, s.source_type, s.title
+            FROM section_citations sc
+            JOIN sources s ON sc.source_id = s.source_id
+            WHERE sc.section_id = ?
+            """,
+            (section_id,)
+        )
+
+        citations = [
+            Citation(
+                source_id=row["source_id"],
+                source_type=row["source_type"],
+                source_title=row["title"],
+                timestamp_ms=row["timestamp_ms"],
+                timestamp_formatted=row["timestamp_formatted"],
+                relevance_score=row["relevance_score"]
+            )
+            for row in citation_results
+        ]
+
+        # Get section metadata
+        section_meta = db.execute_one(
+            """
+            SELECT confidence_score, has_contradictions, controversy_notes
+            FROM course_sections WHERE section_id = ?
+            """,
+            (section_id,)
+        )
+
+        # Build enhanced section
+        section.confidence_score = section_meta["confidence_score"] if section_meta else 0.0
+        section.has_contradictions = section_meta["has_contradictions"] if section_meta else False
+        section.controversy_notes = section_meta["controversy_notes"] if section_meta else None
+        section.citations = citations
+        section.consensus_claims = section_consensus
+        section.contradictions = section_contradictions
+
+        all_consensus_claims.extend(section_consensus)
+        all_contradictions.extend(section_contradictions)
+
+    # Calculate course-level summary
+    avg_confidence = sum(s.confidence_score for s in sections) / len(sections) if sections else 0.0
+
+    return CourseResponse(
+        course_id=course_id,
+        title=course_title,
+        description=course_description,
+        metadata=metadata,
+        sections=sections,
+        glossary=glossary,
+        total_consensus_claims=len(all_consensus_claims),
+        total_contradictions=len(all_contradictions),
+        avg_section_confidence=avg_confidence
+    )
+```
+
+---
+
+### Layer 3: New Consensus Query Endpoints
+
+**Add to `backend/api/routes/courses.py`:**
+
+```python
+@router.get("/{course_id}/consensus", response_model=ConsensusResponse)
+async def get_course_consensus(course_id: str):
+    """Get all consensus claims for a course."""
+
+    # Verify course exists
+    course = db.execute_one("SELECT * FROM courses WHERE course_id = ?", (course_id,))
+    if not course:
+        raise HTTPException(status_code=404, detail="Course not found")
+
+    # Get all consensus claims
+    consensus_results = db.execute(
+        """
+        SELECT DISTINCT cc.*
+        FROM consensus_claims cc
+        JOIN claims c ON json_extract(cc.support_claim_ids, '$[0]') = c.claim_id
+        JOIN course_sources cs ON c.source_id = cs.source_id
+        WHERE cs.course_id = ?
+        ORDER BY cc.confidence DESC
+        """,
+        (course_id,)
+    )
+
+    consensus_claims = [
+        ConsensusClaim(
+            consensus_id=row["consensus_id"],
+            subject=row["subject"],
+            predicate=row["predicate"],
+            object=row["object"],
+            confidence=row["confidence"],
+            support_count=row["support_count"],
+            support_sources=json.loads(row["support_sources"])
+        )
+        for row in consensus_results
+    ]
+
+    return ConsensusResponse(
+        course_id=course_id,
+        consensus_claims=consensus_claims,
+        total_count=len(consensus_claims)
+    )
+
+@router.get("/{course_id}/contradictions", response_model=ContradictionResponse)
+async def get_course_contradictions(course_id: str):
+    """Get all contradictions for a course."""
+
+    # Verify course exists
+    course = db.execute_one("SELECT * FROM courses WHERE course_id = ?", (course_id,))
+    if not course:
+        raise HTTPException(status_code=404, detail="Course not found")
+
+    # Get all contradictions
+    contradiction_results = db.execute(
+        """
+        SELECT DISTINCT cont.*
+        FROM contradictions cont
+        JOIN claims c1 ON cont.claim_id_1 = c1.claim_id
+        JOIN course_sources cs ON c1.source_id = cs.source_id
+        WHERE cs.course_id = ?
+        """,
+        (course_id,)
+    )
+
+    contradictions = [
+        Contradiction(
+            contradiction_id=row["contradiction_id"],
+            claim_id_1=row["claim_id_1"],
+            claim_id_2=row["claim_id_2"],
+            reasoning=row["reasoning"]
+        )
+        for row in contradiction_results
+    ]
+
+    return ContradictionResponse(
+        course_id=course_id,
+        contradictions=contradictions,
+        total_count=len(contradictions)
+    )
+```
+
+**Add response models to `backend/api/models/responses.py`:**
+
+```python
+class ConsensusResponse(BaseModel):
+    """Response for consensus claims query."""
+    course_id: str
+    consensus_claims: List[ConsensusClaim]
+    total_count: int
+
+class ContradictionResponse(BaseModel):
+    """Response for contradictions query."""
+    course_id: str
+    contradictions: List[Contradiction]
+    total_count: int
+```
+
+---
+
+## 24.3 Example Request/Response Payloads
+
+### Example 1: Enhanced GET `/api/v1/courses/{course_id}` Response
+
+**Request:**
+```bash
+GET /api/v1/courses/course_abc123
+```
+
+**Response:**
+```json
+{
+  "course_id": "course_abc123",
+  "title": "Introduction to Python Decorators",
+  "description": "Learn how decorators work in Python...",
+  "metadata": {
+    "source_count": 3,
+    "estimated_time": "4 hours"
+  },
+  "total_consensus_claims": 12,
+  "total_contradictions": 1,
+  "avg_section_confidence": 0.82,
+  "sections": [
+    {
+      "id": "section_xyz",
+      "title": "What are Decorators?",
+      "content": "Decorators are functions that modify other functions...",
+      "confidence_score": 0.88,
+      "has_contradictions": false,
+      "controversy_notes": null,
+      "citations": [
+        {
+          "source_id": "source_yt1",
+          "source_type": "youtube",
+          "source_title": "Python Decorators Explained",
+          "timestamp_ms": 125000,
+          "timestamp_formatted": "2:05",
+          "relevance_score": 0.95
+        },
+        {
+          "source_id": "source_art1",
+          "source_type": "article",
+          "source_title": "Real Python: Decorators Guide",
+          "timestamp_ms": null,
+          "timestamp_formatted": null,
+          "relevance_score": 0.92
+        }
+      ],
+      "consensus_claims": [
+        {
+          "consensus_id": "cons_abc123",
+          "subject": "Python decorators",
+          "predicate": "modify",
+          "object": "function behavior",
+          "confidence": 0.93,
+          "support_count": 3,
+          "support_sources": ["source_yt1", "source_art1", "source_art2"]
+        }
+      ],
+      "contradictions": []
+    },
+    {
+      "id": "section_disputed",
+      "title": "Performance Impact",
+      "content": "Decorators may impact performance...",
+      "confidence_score": 0.65,
+      "has_contradictions": true,
+      "controversy_notes": "Conflicting information: Source A claims decorators have negligible overhead, but Source B states they can slow down function calls by 10-20%.",
+      "citations": [
+        {
+          "source_id": "source_yt2",
+          "source_type": "youtube",
+          "source_title": "Python Performance Tips",
+          "timestamp_ms": 340000,
+          "timestamp_formatted": "5:40",
+          "relevance_score": 0.78
+        }
+      ],
+      "consensus_claims": [],
+      "contradictions": [
+        {
+          "contradiction_id": "contr_xyz789",
+          "claim_id_1": "claim_perf1",
+          "claim_id_2": "claim_perf2",
+          "reasoning": "Conflicting performance metrics for decorator overhead"
+        }
+      ]
+    }
+  ],
+  "glossary": [
+    {"term": "Decorator", "definition": "A function that wraps another function..."}
+  ]
+}
+```
+
+---
+
+### Example 2: GET `/api/v1/courses/{course_id}/consensus` Response
+
+**Request:**
+```bash
+GET /api/v1/courses/course_abc123/consensus
+```
+
+**Response:**
+```json
+{
+  "course_id": "course_abc123",
+  "total_count": 12,
+  "consensus_claims": [
+    {
+      "consensus_id": "cons_abc123",
+      "subject": "Python decorators",
+      "predicate": "modify",
+      "object": "function behavior",
+      "confidence": 0.93,
+      "support_count": 3,
+      "support_sources": ["source_yt1", "source_art1", "source_art2"]
+    },
+    {
+      "consensus_id": "cons_def456",
+      "subject": "@wraps decorator",
+      "predicate": "preserves",
+      "object": "original function metadata",
+      "confidence": 0.89,
+      "support_count": 2,
+      "support_sources": ["source_yt1", "source_art1"]
+    }
+  ]
+}
+```
+
+---
+
+### Example 3: GET `/api/v1/courses/{course_id}/contradictions` Response
+
+**Request:**
+```bash
+GET /api/v1/courses/course_abc123/contradictions
+```
+
+**Response:**
+```json
+{
+  "course_id": "course_abc123",
+  "total_count": 1,
+  "contradictions": [
+    {
+      "contradiction_id": "contr_xyz789",
+      "claim_id_1": "claim_perf1",
+      "claim_id_2": "claim_perf2",
+      "reasoning": "Conflicting performance metrics: claim_perf1 states 'decorators have negligible overhead' but claim_perf2 states 'decorators can slow down function calls by 10-20%'"
+    }
+  ]
+}
+```
+
+---
+
+## 24.4 Frontend Integration Guide
+
+### UI Components Enabled by Tier 2 API
+
+**1. Section Confidence Badge**
+```tsx
+// Display confidence score for each section
+{section.confidence_score >= 0.8 && (
+  <Badge variant="success">
+    ✓ Verified Content ({Math.round(section.confidence_score * 100)}% confidence)
+  </Badge>
+)}
+
+{section.confidence_score < 0.6 && (
+  <Badge variant="warning">
+    ⚠ Limited Sources ({Math.round(section.confidence_score * 100)}% confidence)
+  </Badge>
+)}
+```
+
+**2. Contradiction Warning**
+```tsx
+// Show warning banner for sections with contradictions
+{section.has_contradictions && (
+  <Alert variant="warning">
+    <AlertIcon>⚠️</AlertIcon>
+    <AlertTitle>Conflicting Information</AlertTitle>
+    <AlertDescription>{section.controversy_notes}</AlertDescription>
+  </Alert>
+)}
+```
+
+**3. Consensus Claim Tooltip**
+```tsx
+// Show consensus support when hovering over claims
+<Tooltip title={`Supported by ${claim.support_count} sources with ${Math.round(claim.confidence * 100)}% confidence`}>
+  <span className="consensus-claim">{claim.object}</span>
+</Tooltip>
+```
+
+**4. Video Timestamp Deep Links**
+```tsx
+// Jump to exact timestamp in YouTube video
+{citation.source_type === 'youtube' && citation.timestamp_formatted && (
+  <a href={`${citation.source_url}?t=${Math.floor(citation.timestamp_ms / 1000)}s`}>
+    Watch at {citation.timestamp_formatted}
+  </a>
+)}
+```
+
+**5. Course Quality Summary**
+```tsx
+// Display course-level quality metrics
+<CourseMetadata>
+  <MetricCard>
+    <MetricLabel>Consensus Claims</MetricLabel>
+    <MetricValue>{course.total_consensus_claims}</MetricValue>
+  </MetricCard>
+
+  <MetricCard>
+    <MetricLabel>Avg. Confidence</MetricLabel>
+    <MetricValue>{Math.round(course.avg_section_confidence * 100)}%</MetricValue>
+  </MetricCard>
+
+  {course.total_contradictions > 0 && (
+    <MetricCard variant="warning">
+      <MetricLabel>Controversial Topics</MetricLabel>
+      <MetricValue>{course.total_contradictions}</MetricValue>
+    </MetricCard>
+  )}
+</CourseMetadata>
+```
+
+---
+
+## 24.5 Testing Requirements
+
+**API Contract Tests:**
+
+**Test File: `backend/tests/test_api_courses.py`**
+
+```python
+import pytest
+from fastapi.testclient import TestClient
+from api.main import app
+
+client = TestClient(app)
+
+class TestCourseAPITier2:
+
+    def test_get_course_includes_consensus_data(self):
+        """Course response should include consensus claims in sections."""
+        response = client.get("/api/v1/courses/test_course_id")
+        assert response.status_code == 200
+
+        data = response.json()
+        assert "total_consensus_claims" in data
+        assert "total_contradictions" in data
+        assert "avg_section_confidence" in data
+
+        # Check section structure
+        section = data["sections"][0]
+        assert "confidence_score" in section
+        assert "has_contradictions" in section
+        assert "controversy_notes" in section
+        assert "citations" in section
+        assert "consensus_claims" in section
+        assert "contradictions" in section
+
+    def test_citation_includes_timestamps(self):
+        """Citations should include formatted timestamps for videos."""
+        response = client.get("/api/v1/courses/test_course_with_video")
+        data = response.json()
+
+        video_citation = next(
+            c for c in data["sections"][0]["citations"]
+            if c["source_type"] == "youtube"
+        )
+
+        assert video_citation["timestamp_ms"] is not None
+        assert video_citation["timestamp_formatted"] is not None
+        assert ":" in video_citation["timestamp_formatted"]  # Format: "12:34"
+
+    def test_consensus_endpoint_returns_all_claims(self):
+        """Consensus endpoint should return all consensus claims for course."""
+        response = client.get("/api/v1/courses/test_course_id/consensus")
+        assert response.status_code == 200
+
+        data = response.json()
+        assert "consensus_claims" in data
+        assert "total_count" in data
+        assert data["total_count"] == len(data["consensus_claims"])
+
+        # Check consensus claim structure
+        claim = data["consensus_claims"][0]
+        assert all(k in claim for k in ["consensus_id", "subject", "predicate", "object", "confidence", "support_count", "support_sources"])
+
+    def test_contradictions_endpoint_returns_conflicts(self):
+        """Contradictions endpoint should return all contradictions for course."""
+        response = client.get("/api/v1/courses/test_course_id/contradictions")
+        assert response.status_code == 200
+
+        data = response.json()
+        assert "contradictions" in data
+        assert "total_count" in data
+
+        if data["total_count"] > 0:
+            contradiction = data["contradictions"][0]
+            assert all(k in contradiction for k in ["contradiction_id", "claim_id_1", "claim_id_2", "reasoning"])
+
+    def test_course_not_found_returns_404(self):
+        """Nonexistent course should return 404."""
+        response = client.get("/api/v1/courses/nonexistent_course_id")
+        assert response.status_code == 404
+
+    def test_confidence_score_range_validation(self):
+        """Confidence scores should be between 0.0 and 1.0."""
+        response = client.get("/api/v1/courses/test_course_id")
+        data = response.json()
+
+        for section in data["sections"]:
+            assert 0.0 <= section["confidence_score"] <= 1.0
+
+        assert 0.0 <= data["avg_section_confidence"] <= 1.0
+```
+
+---
+
+## 24.6 Acceptance Criteria
+
+**API Exposure:**
+- ✅ GET `/api/v1/courses/{course_id}` returns enhanced sections with consensus data
+- ✅ GET `/api/v1/courses/{course_id}/consensus` returns all consensus claims
+- ✅ GET `/api/v1/courses/{course_id}/contradictions` returns all contradictions
+- ✅ Citations include timestamps and relevance scores
+- ✅ Course-level summary includes `total_consensus_claims`, `total_contradictions`, `avg_section_confidence`
+
+**Schema Validation:**
+- ✅ Pydantic models validate all responses (no invalid data returned)
+- ✅ Confidence scores constrained to [0.0, 1.0] range
+- ✅ Support counts are positive integers
+- ✅ Timestamps formatted correctly (e.g., "12:34")
+
+**Backwards Compatibility:**
+- ✅ Existing API clients (Tier 1) still function (new fields are optional)
+- ✅ Legacy course format (structure in JSON) still supported
+
+**Performance:**
+- ✅ GET `/api/v1/courses/{course_id}` responds in <500ms (including consensus queries)
+- ✅ Database queries optimized with proper indexes
+- ✅ No N+1 query problems (batch fetch consensus/contradictions)
+
+**Documentation:**
+- ✅ OpenAPI/Swagger docs updated with new response models
+- ✅ Example payloads documented in API reference
+- ✅ Frontend integration guide written
+
+---
+
+# 25. TIER 2 IMPLEMENTATION ROADMAP FOR CURSOR
+
+## 25.1 Implementation Sequence
+
+**Day 1: Consensus Integration**
+1. Create `backend/services/processing/consensus_scorer.py` (ConsensusScorer class)
+2. Add `section_claims` table to `backend/db/schema.sql`
+3. Modify `backend/services/processing/course_builder.py`:
+   - Import ConsensusScorer
+   - Track claim-to-section mapping during content generation
+   - Call `calculate_consensus_adjusted_score()` before storing section
+4. Modify `backend/core/pipeline.py`:
+   - Pass consensus claims and contradictions to `build_complete_course()`
+5. Write unit tests:
+   - `backend/tests/test_consensus_builder.py`
+   - `backend/tests/test_consensus_scorer.py`
+
+**Day 2: API Schema Enhancement**
+1. Update `backend/api/models/responses.py`:
+   - Add `ConsensusClaim`, `Contradiction`, `Citation` models
+   - Enhance `Section` model with consensus fields
+   - Enhance `CourseResponse` with course-level summary fields
+2. Add `ConsensusResponse`, `ContradictionResponse` models
+3. Write API contract tests (`backend/tests/test_api_courses.py`)
+
+**Day 3: API Endpoint Implementation**
+1. Modify `backend/api/routes/courses.py`:
+   - Enhance GET `/{course_id}` to fetch and return consensus data
+   - Add GET `/{course_id}/consensus` endpoint
+   - Add GET `/{course_id}/contradictions` endpoint
+2. Test all endpoints with Postman/curl
+3. Update OpenAPI/Swagger documentation
+
+**Day 4: Integration Testing & Documentation**
+1. Write integration tests (`backend/tests/test_pipeline_integration.py`)
+2. Run end-to-end pipeline and verify consensus data flows to API
+3. Write frontend integration guide (markdown doc)
+4. Performance testing (ensure <500ms response time)
+5. Code review and merge to main
+
+---
+
+## 25.2 Testing Checklist
+
+**Unit Tests (Day 1):**
+- [ ] ConsensusBuilder: empty claims, identical claims, contradictions, similarity threshold, embedding fallback
+- [ ] ConsensusScorer: high consensus boost, contradiction penalty, mixed evidence, boundary cases
+
+**API Tests (Day 2):**
+- [ ] GET `/courses/{id}` includes consensus data
+- [ ] GET `/courses/{id}/consensus` returns all claims
+- [ ] GET `/courses/{id}/contradictions` returns conflicts
+- [ ] Citations include timestamps
+- [ ] Confidence scores in valid range [0.0, 1.0]
+- [ ] 404 for nonexistent courses
+
+**Integration Tests (Day 4):**
+- [ ] End-to-end pipeline propagates consensus to sections
+- [ ] Sections with contradictions have `has_contradictions = TRUE`
+- [ ] Controversy notes populated
+- [ ] API responses match schema
+
+---
+
+## 25.3 Acceptance Criteria
+
+**Consensus Integration:**
+- ✅ Section confidence scores reflect consensus strength
+- ✅ Contradictions marked in sections
+- ✅ Controversy notes populated
+- ✅ Claim-to-section mapping stored
+- ✅ Unit test coverage ≥90%
+
+**API Exposure:**
+- ✅ All 3 endpoints functional (GET course, consensus, contradictions)
+- ✅ Enhanced schemas validated with Pydantic
+- ✅ Frontend integration guide written
+- ✅ Performance <500ms for GET `/courses/{id}`
+- ✅ OpenAPI docs updated
+
+**Quality:**
+- ✅ No regressions (existing tests still pass)
+- ✅ Code documented with docstrings
+- ✅ Integration tests pass end-to-end
+
+---
+
+**END OF TIER 2 ARCHITECTURE SPECIFICATIONS**
+
+---
+
 **END OF SYSTEM NOTES**
