@@ -10,6 +10,7 @@ from datetime import datetime
 from services.ingestion.youtube_fetcher import youtube_fetcher
 from services.ingestion.article_scraper import article_scraper
 from services.ingestion.source_discoverer import source_discoverer
+from services.ingestion.cache_manager import cache_manager
 from services.processing.transcriber import (
     normalize_youtube_transcript,
     normalize_article_content,
@@ -18,7 +19,9 @@ from services.processing.transcriber import (
 from services.processing.chunker import SemanticChunker, rechunk_if_needed
 from services.processing.llm_expander import ChunkExpander
 from services.processing.course_builder import build_complete_course
+from services.course_builder import structure_generator
 from services.extraction.claim_extractor import claim_extractor
+from services.extraction.consensus_builder import consensus_builder
 from core.database import db
 
 
@@ -98,7 +101,10 @@ class CourseCreationPipeline:
                 f"and {len(discovery_result.article_urls)} articles. "
                 f"Try a different query or ensure videos have captions."
             )
-        
+
+        # Persist sources before downstream foreign-key usage
+        raw_sources = [self._store_source(source) for source in raw_sources]
+
         # STAGE 3: Transcription & Normalization
         transcripts = []
         
@@ -173,7 +179,7 @@ class CourseCreationPipeline:
         # Build source_id map from chunks (chunk_id -> source_id)
         all_claims = []
         source_id_map = {chunk.chunk_id: chunk.source_id for chunk in all_chunks}
-        
+
         for expanded in expanded_chunks:
             # Get source_id from the chunk this expansion is based on
             source_id = source_id_map.get(expanded.source_chunk_id, "unknown")
@@ -193,13 +199,22 @@ class CourseCreationPipeline:
                     all_claims.append(claim_data)
                     # Store claim
                     self._store_claim(claim_data)
-        
+
+        # STAGE 6.5: Consensus & Contradiction Detection
+        consensus_results = consensus_builder.build_consensus(all_claims)
+        for consensus in consensus_results.get("consensus_claims", []):
+            self._store_consensus_claim(consensus)
+
+        for contradiction in consensus_results.get("contradictions", []):
+            self._store_contradiction(contradiction)
+
         # STAGE 7 & 8: Course Building & Section Synthesis
         course_data = build_complete_course(
             query=query,
             expanded_chunks=expanded_chunks,
             sources=raw_sources,
-            course_id=course_id
+            course_id=course_id,
+            consensus_claims=consensus_results.get("consensus_claims", []),
         )
         
         # STAGE 9: Store course and sections
@@ -259,7 +274,10 @@ class CourseCreationPipeline:
                 "No sources with valid transcripts were successfully fetched. "
                 "Ensure YouTube videos have captions enabled."
             )
-        
+
+        # Persist sources before claims/chunks reference them
+        sources = [self._store_source(source) for source in sources]
+
         # Step 2: Claim Extraction
         all_claims = []
         for source in sources:
@@ -270,7 +288,13 @@ class CourseCreationPipeline:
                     source_id=source["source_id"],
                 )
                 all_claims.extend(claims)
-        
+
+        consensus_results = consensus_builder.build_consensus(all_claims)
+        for consensus in consensus_results.get("consensus_claims", []):
+            self._store_consensus_claim(consensus)
+        for contradiction in consensus_results.get("contradictions", []):
+            self._store_contradiction(contradiction)
+
         # Step 3: Course Building
         course_structure = structure_generator.build_course(
             query=query,
@@ -287,6 +311,70 @@ class CourseCreationPipeline:
         )
         
         return course_id
+
+    def _store_source(self, source: Dict[str, Any]) -> Dict[str, Any]:
+        """Persist a source and return the stored record (ensures source_id is valid)."""
+        source_type = source.get("source_type") or (
+            "youtube" if "youtube.com" in source.get("url", "") else "article"
+        )
+        source_url = source.get("url")
+        if not source_url:
+            raise ValueError("Source URL is required for persistence")
+
+        existing = db.execute_one(
+            "SELECT source_id FROM sources WHERE url = ?", (source_url,)
+        )
+
+        # Normalize transcript/content field
+        transcript_text = source.get("transcript") or source.get("content") or ""
+        metadata = source.get("metadata") or {}
+
+        if existing:
+            source["source_id"] = existing["source_id"]
+            db.execute_write(
+                """
+                UPDATE sources
+                SET source_type = ?, title = ?, transcript = ?, metadata = ?, vct_tier = ?
+                WHERE url = ?
+                """,
+                (
+                    source_type,
+                    source.get("title"),
+                    transcript_text,
+                    json.dumps(metadata),
+                    source.get("vct_tier"),
+                    source_url,
+                ),
+            )
+        else:
+            db.execute_write(
+                """
+                INSERT INTO sources (source_id, source_type, url, title, transcript, metadata, vct_tier)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    source.get("source_id"),
+                    source_type,
+                    source_url,
+                    source.get("title"),
+                    transcript_text,
+                    json.dumps(metadata),
+                    source.get("vct_tier"),
+                ),
+            )
+
+        # Keep cache in sync for future fetches
+        cache_manager.save_source(
+            source_id=source["source_id"],
+            source_type=source_type,
+            url=source_url,
+            title=source.get("title"),
+            transcript=transcript_text,
+            metadata=metadata,
+            vct_tier=source.get("vct_tier"),
+        )
+
+        return source
     
     def _store_transcript(self, transcript) -> None:
         """Store RawTranscript in database."""
@@ -405,6 +493,42 @@ class CourseCreationPipeline:
                 claim["timestamp_ms"],
                 claim["confidence"],
             )
+        )
+
+    def _store_consensus_claim(self, consensus: Dict[str, Any]) -> None:
+        """Store a consensus claim derived from multiple claims."""
+        db.execute_write(
+            """
+            INSERT OR IGNORE INTO consensus_claims
+            (consensus_id, subject, predicate, object, support_claim_ids, support_sources, support_count, confidence)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                consensus["consensus_id"],
+                consensus.get("subject"),
+                consensus.get("predicate"),
+                consensus.get("object"),
+                json.dumps(consensus.get("support_claim_ids", [])),
+                json.dumps(consensus.get("support_sources", [])),
+                consensus.get("support_count"),
+                consensus.get("confidence"),
+            ),
+        )
+
+    def _store_contradiction(self, contradiction: Dict[str, Any]) -> None:
+        """Persist detected contradictions between claims."""
+        db.execute_write(
+            """
+            INSERT OR IGNORE INTO contradictions
+            (contradiction_id, claim_id_1, claim_id_2, reasoning)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                contradiction["contradiction_id"],
+                contradiction["claim_id_1"],
+                contradiction["claim_id_2"],
+                contradiction.get("reasoning", ""),
+            ),
         )
     
     def _store_enhanced_course(

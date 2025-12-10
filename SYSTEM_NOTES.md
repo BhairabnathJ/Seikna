@@ -5302,4 +5302,13 @@ logger.info({
 
 ---
 
+CODEX IMPLEMENTATION
+
+- Added source persistence inside the pipeline so transcripts, chunks, and claims always reference existing `sources` rows; updates cache synchronization and preserves existing source_ids when URLs are already stored.
+- Fixed the legacy pipeline path by importing the course structure generator, ensuring explicit URL runs can build courses without NameError.
+- Next: implement consensus/contradiction builder integration and expand transaction safety around multi-table writes.
+- Implemented a consensus builder that clusters extracted claims, stores consensus and contradiction records, and feeds consensus confidence into section scoring for the enhanced pipeline.
+
+---
+
 **END OF SYSTEM NOTES**

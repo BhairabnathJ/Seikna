@@ -33,6 +33,18 @@ CREATE TABLE IF NOT EXISTS claims (
     FOREIGN KEY (source_id) REFERENCES sources(source_id)
 );
 
+-- Consensus claims derived from clustering similar claims
+CREATE TABLE IF NOT EXISTS consensus_claims (
+    consensus_id TEXT PRIMARY KEY,
+    subject TEXT,
+    predicate TEXT,
+    object TEXT,
+    support_claim_ids TEXT,  -- JSON array of claim_ids
+    support_sources TEXT,    -- JSON array of source_ids
+    support_count INTEGER,
+    confidence REAL
+);
+
 CREATE TABLE IF NOT EXISTS contradictions (
     contradiction_id TEXT PRIMARY KEY,
     claim_id_1 TEXT NOT NULL,
