@@ -5305,9 +5305,10 @@ logger.info({
 CODEX IMPLEMENTATION
 
 - Added source persistence inside the pipeline so transcripts, chunks, and claims always reference existing `sources` rows; updates cache synchronization and preserves existing source_ids when URLs are already stored.
-- Fixed the legacy pipeline path by importing the course structure generator, ensuring explicit URL runs can build courses without NameError.
+- Fixed the explicit URL pipeline path by importing the course structure generator, ensuring explicit URL runs can build courses without NameError.
 - Implemented a consensus builder that clusters extracted claims, stores consensus and contradiction records, and feeds consensus confidence into section scoring for the enhanced pipeline.
-- Remaining plan: wrap multi-table pipeline writes in DB transactions, expose consensus/contradiction data through the API, surface consensus/conflict indicators in the frontend course views, and sequence the upcoming Phase 2/3/4 work (vision ingestion, gamification endpoints, RAG chat retrieval) after the transaction hardening.
+- Unified both pipeline entry points to share the same normalization → chunking → expansion → consensus-aware course builder path, added a shared processing helper, and enforced stable `source_id` creation when inserting new sources.
+- Next steps: wrap multi-table pipeline writes in DB transactions, expose consensus/contradiction data through the API, surface consensus/conflict indicators in the frontend course views, and proceed with the queued Phase 2 (vision), Phase 3 (gamification), and Phase 4 (RAG chat) milestones after transaction hardening.
 
 ---
 

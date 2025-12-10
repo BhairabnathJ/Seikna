@@ -326,19 +326,19 @@ def build_complete_course(
     
     for i, sec_def in enumerate(structure_sections):
         section_title = sec_def.get("title", f"Section {i+1}")
-        
+
         # Find relevant chunks (simplified: use all chunks for now)
         relevant_chunks = expanded_chunks
-        
+
         # Synthesize section
-            section = builder.synthesize_section(
-                section_title=section_title,
-                relevant_chunks=relevant_chunks,
-                section_index=i,
-                course_id=course_id,
-                sources=sources,
-                consensus_claims=consensus_claims or [],
-            )
+        section = builder.synthesize_section(
+            section_title=section_title,
+            relevant_chunks=relevant_chunks,
+            section_index=i,
+            course_id=course_id,
+            sources=sources,
+            consensus_claims=consensus_claims or [],
+        )
         sections.append(section)
     
     return {
