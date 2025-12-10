@@ -82,7 +82,8 @@ class CourseBuilder:
         relevant_chunks: List[ExpandedChunk],
         section_index: int,
         course_id: str,
-        sources: Optional[List[Dict[str, Any]]] = None
+        sources: Optional[List[Dict[str, Any]]] = None,
+        consensus_claims: Optional[List[Dict[str, Any]]] = None,
     ) -> CourseSection:
         """Create single CourseSection from chunks."""
         section_id = f"sec_{course_id}_{uuid.uuid4().hex[:8]}"
@@ -155,7 +156,7 @@ class CourseBuilder:
         )
         
         # Calculate scores
-        scores = self.calculate_section_scores(section, [])
+        scores = self.calculate_section_scores(section, consensus_claims or [])
         section.coherence_score = scores.get("coherence_score", 0.8)
         section.coverage_score = scores.get("coverage_score", 0.8)
         section.confidence_score = scores.get("confidence_score", 0.8)
@@ -277,6 +278,16 @@ class CourseBuilder:
         
         # Confidence: based on claim agreement (simplified)
         confidence = 0.9  # Default high confidence
+        if consensus_claims:
+            supporting_sources = set(section.primary_sources)
+            aligned_claims = [
+                claim
+                for claim in consensus_claims
+                if supporting_sources.intersection(set(claim.get("support_sources", [])))
+            ]
+            if aligned_claims:
+                avg_conf = sum(claim.get("confidence", 0.8) for claim in aligned_claims) / len(aligned_claims)
+                confidence = min(1.0, 0.7 + 0.3 * avg_conf)
         
         return {
             "coherence_score": min(1.0, coherence),
@@ -289,7 +300,8 @@ def build_complete_course(
     query: str,
     expanded_chunks: List[ExpandedChunk],
     sources: List[Dict[str, Any]],
-    course_id: str
+    course_id: str,
+    consensus_claims: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """
     Main orchestration function for building complete course.
@@ -314,17 +326,18 @@ def build_complete_course(
     
     for i, sec_def in enumerate(structure_sections):
         section_title = sec_def.get("title", f"Section {i+1}")
-        
+
         # Find relevant chunks (simplified: use all chunks for now)
         relevant_chunks = expanded_chunks
-        
+
         # Synthesize section
         section = builder.synthesize_section(
             section_title=section_title,
             relevant_chunks=relevant_chunks,
             section_index=i,
             course_id=course_id,
-            sources=sources
+            sources=sources,
+            consensus_claims=consensus_claims or [],
         )
         sections.append(section)
     
