@@ -5330,7 +5330,7 @@ Actionable tasks from recommendations (implementation queue)
 
 ---
 
-## OVERVIEW
+##OVERVIEW
 
 This document specifies the architecture for **Tier 1 Foundation Hardening**, comprising three critical architectural domains that ensure system reliability, maintainability, and correctness:
 
